@@ -9,6 +9,7 @@
   body{margin:0;background:#0d1117;color:#e6edf3;font-family:Arial,sans-serif;padding:14px;max-width:640px;margin:0 auto}
   h1{font-size:18px;margin:0 0 10px}
   .row{display:flex;gap:8px;margin-bottom:10px}
+  select{padding:10px;border-radius:8px;border:1px solid #30363d;background:#161b22;color:#e6edf3;font-size:16px}
   input{flex:1;min-width:0;padding:10px;border-radius:8px;border:1px solid #30363d;background:#161b22;color:#e6edf3;font-size:16px;text-transform:uppercase}
   button{padding:10px 16px;border:0;border-radius:8px;background:#238636;color:#fff;font-size:16px}
   .chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
@@ -47,6 +48,15 @@
 </div>
 <div id="err"></div>
 <div id="out"><div class="card">Loading...</div></div>
+<div class="card" id="bt">
+  <div class="lbl">Backtest: Probability aur Expected Value</div>
+  <div class="note">Purane candles pe wahi score chala kar dekhta hai (6 layers: flow, VWAP, volume, RSI, structure, sweep). Fees (0.08%) kaat kar.</div>
+  <div class="row" style="margin-top:10px">
+    <select id="tf"><option value="15m">15m</option><option value="1h">1h</option><option value="5m">5m</option></select>
+    <button onclick="runBT()">Run Backtest</button>
+  </div>
+  <div id="btout" class="note"></div>
+</div>
 <div id="time"></div>
 <div class="foot">
   Ye sirf analysis ka madadgar hai. Kisi profit ya accuracy ki guarantee nahi.<br>
@@ -310,6 +320,101 @@ function load(){
     document.getElementById("err").textContent = "Error: " + e.message;
   });
 }
+/* ---------- backtest ---------- */
+var FEE = 0.08;   // round trip fee in percent
+var HOLD = 12;    // candles to hold
+
+function fetchK(sym, tf, pages){
+  var all = [];
+  function page(n, end){
+    var url = "/fapi/v1/klines?symbol=" + sym + "&interval=" + tf + "&limit=1500" + (end ? "&endTime=" + end : "");
+    return j(url).then(function(d){
+      all = d.concat(all);
+      if(n <= 1 || d.length < 1500) return all;
+      return page(n - 1, d[0][0] - 1);
+    });
+  }
+  return page(pages, null).then(function(a){ a.pop(); return a; });
+}
+
+function flowBT(k, i){
+  var buy = 0, tot = 0, x;
+  for(x = i - 5; x <= i; x++){ buy += num(k[x][9]); tot += num(k[x][5]); }
+  var r = buy / tot * 100;
+  return r > 53 ? 1 : (r < 47 ? -1 : 0);
+}
+function sc(L){ return L ? L.score : 0; }
+
+function btScore(k, i){
+  var w = k.slice(i - 99, i + 2);
+  var reg = regime(w);
+  if(reg && reg.type === "Volatile") return null;
+  return flowBT(k, i) + sc(vwapLayer(k.slice(i - 47, i + 1))) + sc(volLayer(w)) +
+         sc(rsiLayer(w)) + sc(structLayer(w)) + sc(sweepLayer(w));
+}
+
+function stats(a){
+  var n = a.length;
+  if(!n) return {n:0};
+  var wins = 0, s = 0, i;
+  for(i = 0; i < n; i++){ if(a[i] > 0) wins++; s += a[i]; }
+  var p = wins / n;
+  return {n:n, win:p * 100, ci:1.96 * Math.sqrt(p * (1 - p) / n) * 100, avg:s / n};
+}
+function line(name, st){
+  if(!st.n) return name + ": koi trade nahi mila";
+  return name + ": " + st.n + " trades | Win " + st.win.toFixed(0) + "% (±" + st.ci.toFixed(0) + ") | Avg " + (st.avg >= 0 ? "+" : "") + st.avg.toFixed(3) + "% per trade";
+}
+
+function backtest(k){
+  var res = {longs:[], shorts:[], all:[], baseL:[], baseS:[]};
+  var i = 100, last = k.length - HOLD - 2;
+  while(i < last){
+    var c0 = num(k[i][4]), c1 = num(k[i + HOLD][4]);
+    var ret = (c1 / c0 - 1) * 100;
+    res.baseL.push(ret - FEE);
+    res.baseS.push(-ret - FEE);
+    var sc6 = btScore(k, i);
+    if(sc6 !== null && sc6 >= 3){ res.longs.push(ret - FEE); res.all.push(ret - FEE); i += HOLD; }
+    else if(sc6 !== null && sc6 <= -3){ res.shorts.push(-ret - FEE); res.all.push(-ret - FEE); i += HOLD; }
+    else i++;
+  }
+  return res;
+}
+
+function runBT(){
+  var s = document.getElementById("sym").value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  var tf = document.getElementById("tf").value;
+  var out = document.getElementById("btout");
+  out.className = "note y";
+  out.textContent = "Data le raha hun, 20-30 second lag sakte hain...";
+  fetchK(s, tf, 3).then(function(k){
+    if(k.length < 300) throw new Error("Data kam hai");
+    var r = backtest(k);
+    var days = (num(k[k.length-1][0]) - num(k[0][0])) / 86400000;
+    var all = stats(r.all);
+    var half = Math.floor(r.all.length / 2);
+    var h1 = stats(r.all.slice(0, half)), h2 = stats(r.all.slice(half));
+    var m = {"5m":5, "15m":15, "1h":60}[tf] * HOLD;
+    var h = "<b>" + s + " | " + tf + " | " + days.toFixed(1) + " din | Hold " + (m >= 60 ? (m/60) + " ghante" : m + " min") + "</b><br><br>";
+    h += line("LONG", stats(r.longs)) + "<br>" + line("SHORT", stats(r.shorts)) + "<br><br>";
+    h += line("Total", all) + "<br>";
+    h += "Market ka average (random entry): Long " + stats(r.baseL).avg.toFixed(3) + "% | Short " + stats(r.baseS).avg.toFixed(3) + "%<br>";
+    if(half >= 5) h += "Pehla hissa avg " + h1.avg.toFixed(3) + "% | Dusra hissa avg " + h2.avg.toFixed(3) + "%<br>";
+    h += "<br>";
+    var v, cls;
+    if(all.n < 30){ v = "Sample bohat chhota hai, is par bharosa mat karo."; cls = "y"; }
+    else if(all.avg <= 0){ v = "Fees ke baad is coin/timeframe pe edge nahi mila."; cls = "r"; }
+    else if(half >= 5 && (h1.avg <= 0 || h2.avg <= 0)){ v = "Average positive hai lekin dono hisson mein nahi. Kamzor saboot."; cls = "y"; }
+    else { v = "Is data mein positive raha. Ye guarantee nahi, aur coins/timeframes pe bhi check karo."; cls = "g"; }
+    out.className = "note";
+    out.innerHTML = h + '<span class="' + cls + '"><b>' + v + '</b></span>';
+  }).catch(function(e){
+    out.className = "note r";
+    out.textContent = "Error: " + e.message;
+  });
+}
+
 load();
 setInterval(load, 20000);
 </script>
